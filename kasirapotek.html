@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sistem Kasir Toko Husna (V71 - Mode Offline dengan Sinkronisasi Otomatis)</title>
+    <title>Sistem Kasir Apotek Sehat (V71 - Mode Offline dengan Sinkronisasi Otomatis)</title>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -54,7 +54,7 @@
     <!-- React & Dependencies -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"></script>
     
     <!-- HTML2Canvas (Untuk Generate JPG) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -69,510 +69,427 @@
     <!-- ExcelJS for Excel Export with Full Styling Support -->
     <script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
 
-    <!-- Supabase SDK (replaces Firebase; see supabase_migration.sql for the matching schema) -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <!-- Database Lokal (pengganti Firebase) — semua data disimpan di IndexedDB browser, tanpa cloud sync -->
     <script>
-/* ============================================================================
- * Toko Husna Kasir — Firebase → Supabase compatibility shim
- * ============================================================================
- * This file re-implements every `window.X` Firestore function the rest of the
- * app calls (collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc,
- * getDocs, onSnapshot, query, where, orderBy, limit, increment, serverTimestamp,
- * writeBatch, plus the auth functions) on top of Supabase — so NOTHING else in
- * the app needs to change. Business logic below this file calls the exact same
- * `window.X(...)` functions it always did; only what's behind them changed.
- * ==========================================================================*/
 (function () {
-  'use strict';
+    'use strict';
 
-  // ── Configuration ─────────────────────────────────────────────────────────
-  var SUPABASE_URL = 'https://kusetiuorizpufixfwbs.supabase.co';
-  var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1c2V0aXVvcml6cHVmaXhmd2JzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5NjMzOTQsImV4cCI6MjEwMTUzOTM5NH0.VmuEY9-EGugF648ziFcW-L8QQhp7QRW3t6JUdDsmGmk';
+    // ============================================================
+    // Mesin database LOKAL (pengganti Firebase/Firestore)
+    // Menyimpan semua data di IndexedDB milik browser, dengan API
+    // yang sengaja dibuat mirip Firestore (collection/doc/addDoc/
+    // onSnapshot/query/dst) supaya seluruh kode aplikasi di bawah
+    // tidak perlu diubah sama sekali.
+    // ============================================================
 
-  // Exposed for the one spot in the app (tab-close beacon) that needs to hit
-  // the REST endpoint directly, since navigator.sendBeacon can't use the SDK.
-  window.SUPABASE_URL = SUPABASE_URL;
-  window.SUPABASE_ANON_KEY = SUPABASE_ANON_KEY;
+    var IDB_NAME = 'husna_kasir_local_db';
+    var IDB_VERSION = 1;
+    var STORE_NAME = 'collections';
 
-  if (typeof supabase === 'undefined' || !supabase.createClient) {
-    console.error('Supabase client library failed to load. Check your network/CDN access.');
-  }
-  var sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    auth: { persistSession: false },
-  });
-  window.__sb = sb; // exposed for debugging in the console only
-
-  // ── ID generation (stand-in for Firestore's client-generated doc IDs) ─────
-  function generateId() {
-    // RFC4122-ish v4 UUID via Math.random. We don't rely on Web Crypto here
-    // because this app may be served over plain http:// on a local network
-    // (common for an in-store POS), where crypto.randomUUID is unavailable.
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-      var r = (Math.random() * 16) | 0;
-      var v = c === 'x' ? r : (r & 0x3) | 0x8;
-      return v.toString(16);
-    });
-  }
-
-  // ── Firestore collection name → Postgres table name ───────────────────────
-  var TABLE_MAP = {
-    active_carts: 'active_carts',
-    cashflow: 'cashflow',
-    catatan: 'catatan',
-    changelog: 'changelog',
-    config: 'config',
-    daily_revenue: 'daily_revenue',
-    dokter_list: 'dokter_list',
-    feedback: 'feedback',
-    inventory: 'inventory',
-    otp_reset: 'otp_reset',
-    paket_barang: 'paket_barang',
-    pasien_list: 'pasien_list',
-    pending_carts: 'pending_carts',
-    presence: 'presence',
-    priceHistory: 'price_history',
-    purchases: 'purchases',
-    settings: 'settings',
-    shift_absensi: 'shift_absensi',
-    shift_config: 'shift_config',
-    shift_jadwal: 'shift_jadwal',
-    shift_karyawan: 'shift_karyawan',
-    shift_lokasi: 'shift_lokasi',
-    stock_opname: 'stock_opname',
-    suppliers: 'suppliers',
-    system_codes: 'system_codes',
-    transactions: 'transactions',
-    transfer_barang: 'transfer_barang',
-    users: 'users',
-  };
-
-  // Field → real generated column, PER TABLE. Derived from an exhaustive audit
-  // of every where()/orderBy() call in the app. Anything not listed here falls
-  // back to querying the JSON path directly (data->>field), which PostgREST
-  // also supports, so unanticipated future fields still work correctly.
-  var FIELD_COLUMN_MAP = {
-    active_carts: { isActive: 'is_active_key', cashierName: 'cashier_name_key', storeId: 'store_id_key' },
-    transactions: { date: 'date_key', storeId: 'store_id_key' },
-    purchases: { date: 'date_key', storeId: 'store_id_key' },
-    suppliers: { name: 'name_key' },
-    cashflow: { date: 'date_key' },
-    daily_revenue: { date: 'date_key' },
-    pending_carts: { date: 'date_key' },
-    stock_opname: { status: 'status_key', profileId: 'profile_id_key', createdAt: 'created_at_key' },
-    price_history: { itemId: 'item_id_key' },
-    catatan: { createdAt: 'created_at_key' },
-    catatan_private: { createdAt: 'created_at_key' },
-    shift_karyawan: { createdAt: 'created_at_key' },
-    shift_lokasi: { createdAt: 'created_at_key' },
-    shift_absensi: { createdAt: 'created_at_key' },
-    transfer_barang: { createdAt: 'created_at_key' },
-    changelog: { position: 'position_key' },
-    users: { username: 'username_key', email: 'email_key' },
-  };
-
-  function resolveColumn(table, field) {
-    var m = FIELD_COLUMN_MAP[table];
-    if (m && m[field]) return m[field];
-    // Defensive fallback for any field we didn't anticipate: PostgREST natively
-    // supports querying/ordering by a JSON path expressed in the column name.
-    return 'data->>' + field;
-  }
-
-  // ── Path parsing: Firestore path segments → {table, id?, extraFilter?} ────
-  // Every path in this app is one of:
-  //   ['artifacts', appId, 'public', 'data', COLLECTION]            (collection)
-  //   ['artifacts', appId, 'public', 'data', COLLECTION, DOC_ID]     (doc)
-  //   ['artifacts', appId, 'users', UID, 'catatan']                 (private collection)
-  //   ['artifacts', appId, 'users', UID, 'catatan', DOC_ID]         (private doc)
-  function parseFullPath(segments) {
-    if (segments[2] === 'public' && segments[3] === 'data') {
-      var collName = segments[4];
-      var table = TABLE_MAP[collName] || collName;
-      if (segments.length <= 5) {
-        return { __type: 'collection', table: table, extraFilter: null };
-      }
-      return { __type: 'doc', table: table, id: segments[5], extraFilter: null };
+    var _dbPromise = null;
+    function openIDB() {
+        if (_dbPromise) return _dbPromise;
+        _dbPromise = new Promise(function (resolve, reject) {
+            var req = indexedDB.open(IDB_NAME, IDB_VERSION);
+            req.onupgradeneeded = function (e) {
+                var idb = e.target.result;
+                if (!idb.objectStoreNames.contains(STORE_NAME)) {
+                    idb.createObjectStore(STORE_NAME);
+                }
+            };
+            req.onsuccess = function (e) { resolve(e.target.result); };
+            req.onerror = function (e) { reject(e.target.error); };
+        });
+        return _dbPromise;
     }
-    if (segments[2] === 'users') {
-      var uid = segments[3];
-      var privColl = segments[4]; // always 'catatan' in this app
-      var privTable = privColl === 'catatan' ? 'catatan_private' : (TABLE_MAP[privColl] || privColl);
-      var extraFilter = { owner_uid: uid || 'anon' };
-      if (segments.length <= 5) {
-        return { __type: 'collection', table: privTable, extraFilter: extraFilter };
-      }
-      return { __type: 'doc', table: privTable, id: segments[5], extraFilter: extraFilter };
+
+    // path (string) -> { [docId]: dataMentah }
+    var cache = Object.create(null);
+    var loaded = Object.create(null);
+    var loadingPromise = Object.create(null);
+    // path (string) -> Set(callback)
+    var listeners = Object.create(null);
+
+    function ensureLoaded(path) {
+        if (loaded[path]) return Promise.resolve();
+        if (loadingPromise[path]) return loadingPromise[path];
+        loadingPromise[path] = openIDB().then(function (idb) {
+            return new Promise(function (resolve, reject) {
+                var tx = idb.transaction(STORE_NAME, 'readonly');
+                var req = tx.objectStore(STORE_NAME).get(path);
+                req.onsuccess = function () {
+                    cache[path] = req.result || Object.create(null);
+                    loaded[path] = true;
+                    resolve();
+                };
+                req.onerror = function () { reject(req.error); };
+            });
+        });
+        return loadingPromise[path];
     }
-    throw new Error('Unrecognized Firestore-style path: ' + segments.join('/'));
-  }
 
-  // ── Firestore-like sentinels: serverTimestamp() / increment() ─────────────
-  // serverTimestamp() is resolved immediately (client clock) into a concrete,
-  // tagged marker {"__ts": "<iso>"} that survives JSON transport as-is; the read
-  // side later unwraps "__ts" markers back into Timestamp-like objects (see
-  // FSTimestamp below) so `.toDate()/.seconds/.toMillis()` keep working exactly
-  // like real Firestore Timestamps, wherever the app still expects them.
-  //
-  // increment() is DELIBERATELY left unresolved here — it's sent to Postgres as
-  // {"__op":"increment","value":N} and resolved atomically server-side (see
-  // fs_merge_fields in the SQL migration), so concurrent cashiers updating
-  // stock never clobber each other the way a client-side read-modify-write would.
-  var SERVER_TIMESTAMP_MARKER = { __isServerTimestampSentinel: true };
-  window.serverTimestamp = function () { return SERVER_TIMESTAMP_MARKER; };
-  window.increment = function (n) { return { __op: 'increment', value: n }; };
-
-  function resolveWriteMarkers(value) {
-    if (value === SERVER_TIMESTAMP_MARKER) {
-      return { __ts: new Date().toISOString() };
+    function persist(path) {
+        return openIDB().then(function (idb) {
+            return new Promise(function (resolve, reject) {
+                var tx = idb.transaction(STORE_NAME, 'readwrite');
+                tx.objectStore(STORE_NAME).put(cache[path], path);
+                tx.oncomplete = function () { resolve(); };
+                tx.onerror = function () { reject(tx.error); };
+            });
+        });
     }
-    if (value === null || value === undefined) return value;
-    if (Array.isArray(value)) return value.map(resolveWriteMarkers);
-    if (typeof value === 'object') {
-      if (value.__op === 'increment') return value; // pass through, resolved server-side
-      var out = {};
-      for (var k in value) if (Object.prototype.hasOwnProperty.call(value, k)) out[k] = resolveWriteMarkers(value[k]);
-      return out;
+
+    function notify(path) {
+        var subs = listeners[path];
+        if (!subs) return;
+        subs.forEach(function (fn) {
+            try { fn(); } catch (e) { console.error('[husna-local-db] listener error:', e); }
+        });
     }
-    return value;
-  }
 
-  // ── Timestamp-like objects on read (mirrors Firestore's Timestamp class) ──
-  function FSTimestamp(iso) {
-    this._iso = iso;
-    var t = new Date(iso).getTime();
-    this._ms = isNaN(t) ? 0 : t;
-  }
-  FSTimestamp.prototype.toDate = function () { return new Date(this._ms); };
-  FSTimestamp.prototype.toMillis = function () { return this._ms; };
-  Object.defineProperty(FSTimestamp.prototype, 'seconds', { get: function () { return Math.floor(this._ms / 1000); } });
-  Object.defineProperty(FSTimestamp.prototype, 'nanoseconds', { get: function () { return (this._ms % 1000) * 1e6; } });
-  FSTimestamp.prototype.isEqual = function (other) { return other instanceof FSTimestamp && other._ms === this._ms; };
-  FSTimestamp.prototype.toString = function () { return new Date(this._ms).toString(); };
-
-  function isTimestampMarker(v) {
-    return v && typeof v === 'object' && !Array.isArray(v) &&
-      typeof v.__ts === 'string' && Object.keys(v).length === 1;
-  }
-
-  function unwrapTimestamps(value) {
-    if (value === null || value === undefined) return value;
-    if (Array.isArray(value)) return value.map(unwrapTimestamps);
-    if (typeof value === 'object') {
-      if (isTimestampMarker(value)) return new FSTimestamp(value.__ts);
-      var out = {};
-      for (var k in value) if (Object.prototype.hasOwnProperty.call(value, k)) out[k] = unwrapTimestamps(value[k]);
-      return out;
+    function genId() {
+        return 'L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
     }
-    return value;
-  }
 
-  function rowToDocData(row) {
-    return unwrapTimestamps((row && row.data) || {});
-  }
+    // ---------- Sentinel: serverTimestamp() & increment() ----------
+    function serverTimestamp() { return { __sentinel: 'serverTimestamp' }; }
+    function increment(n) { return { __sentinel: 'increment', value: n }; }
 
-  // ── collection() / doc() ───────────────────────────────────────────────────
-  window.collection = function (db) {
-    var segments = Array.prototype.slice.call(arguments, 1);
-    var parsed = parseFullPath(segments);
-    if (parsed.__type !== 'collection') {
-      throw new Error('collection() path resolved to a document, not a collection: ' + segments.join('/'));
+    function nowTsMarker() {
+        var ms = Date.now();
+        return { __ts: true, seconds: Math.floor(ms / 1000), nanoseconds: (ms % 1000) * 1e6 };
     }
-    return parsed;
-  };
 
-  window.doc = function (refOrDb) {
-    var rest = Array.prototype.slice.call(arguments, 1);
-    if (refOrDb && refOrDb.__type === 'collection') {
-      var id = rest.length > 0 && rest[0] !== undefined ? rest[0] : generateId();
-      return { __type: 'doc', table: refOrDb.table, id: id, extraFilter: refOrDb.extraFilter };
-    }
-    // refOrDb === window.db: full path from root
-    var parsed = parseFullPath(rest);
-    if (parsed.__type === 'collection') {
-      return { __type: 'doc', table: parsed.table, id: generateId(), extraFilter: parsed.extraFilter };
-    }
-    return parsed;
-  };
+    function clone(x) { return x === undefined ? undefined : JSON.parse(JSON.stringify(x)); }
 
-  // ── query() / where() / orderBy() / limit() ────────────────────────────────
-  window.where = function (field, op, value) { return { __type: 'where', field: field, op: op, value: value }; };
-  window.orderBy = function (field, direction) { return { __type: 'orderBy', field: field, direction: direction || 'asc' }; };
-  window.limit = function (n) { return { __type: 'limit', n: n }; };
-
-  window.query = function (baseRef) {
-    var constraints = Array.prototype.slice.call(arguments, 1);
-    var wheres = [];
-    var orderBys = [];
-    var limitVal = null;
-    constraints.forEach(function (c) {
-      if (!c) return;
-      if (c.__type === 'where') wheres.push(c);
-      else if (c.__type === 'orderBy') orderBys.push(c);
-      else if (c.__type === 'limit') limitVal = c.n;
-    });
-    return {
-      __type: 'query',
-      table: baseRef.table,
-      extraFilter: baseRef.extraFilter,
-      wheres: wheres,
-      orderBys: orderBys,
-      limitVal: limitVal,
-    };
-  };
-
-  function applyWhereOp(q, col, op, val) {
-    switch (op) {
-      case '==': return q.eq(col, val);
-      case '!=': return q.neq(col, val);
-      case '<': return q.lt(col, val);
-      case '<=': return q.lte(col, val);
-      case '>': return q.gt(col, val);
-      case '>=': return q.gte(col, val);
-      case 'in': return q.in(col, val);
-      case 'array-contains': return q.contains(col, [val]);
-      default: return q.eq(col, val);
-    }
-  }
-
-  function buildSelectQuery(refOrQuery) {
-    var table = refOrQuery.table;
-    var q = sb.from(table).select('*');
-    if (refOrQuery.extraFilter) {
-      for (var col in refOrQuery.extraFilter) {
-        if (Object.prototype.hasOwnProperty.call(refOrQuery.extraFilter, col)) {
-          q = q.eq(col, refOrQuery.extraFilter[col]);
+    // Ubah marker timestamp mentah (__ts) menjadi objek dengan method
+    // toDate()/toMillis() seperti Firestore Timestamp, agar kompatibel
+    // dengan kode yang memanggil field.toDate() atau field.seconds.
+    function hydrate(x) {
+        if (x === null || typeof x !== 'object') return x;
+        if (x.__ts === true) {
+            var ms = x.seconds * 1000 + Math.round((x.nanoseconds || 0) / 1e6);
+            return {
+                seconds: x.seconds,
+                nanoseconds: x.nanoseconds || 0,
+                toDate: function () { return new Date(ms); },
+                toMillis: function () { return ms; },
+                isEqual: function (other) {
+                    return !!(other && typeof other.toMillis === 'function' && other.toMillis() === ms);
+                }
+            };
         }
-      }
-    }
-    var wheres = refOrQuery.wheres || [];
-    wheres.forEach(function (w) {
-      q = applyWhereOp(q, resolveColumn(table, w.field), w.op, w.value);
-    });
-    var orderBys = refOrQuery.orderBys || [];
-    orderBys.forEach(function (o) {
-      q = q.order(resolveColumn(table, o.field), { ascending: o.direction !== 'desc' });
-    });
-    if (refOrQuery.limitVal) q = q.limit(refOrQuery.limitVal);
-    return q;
-  }
-
-  // ── Snapshot shapes (mirrors Firestore's DocumentSnapshot / QuerySnapshot) ─
-  function makeDocSnapshot(table, extraFilter, row) {
-    var exists = !!row;
-    return {
-      id: row ? row.id : undefined,
-      exists: function () { return exists; },
-      data: function () { return exists ? rowToDocData(row) : undefined; },
-      ref: { __type: 'doc', table: table, id: row ? row.id : undefined, extraFilter: extraFilter },
-    };
-  }
-
-  function makeQuerySnapshot(table, extraFilter, rows) {
-    var docs = (rows || []).map(function (row) {
-      return {
-        id: row.id,
-        data: function () { return rowToDocData(row); },
-        ref: { __type: 'doc', table: table, id: row.id, extraFilter: extraFilter },
-      };
-    });
-    return {
-      docs: docs,
-      empty: docs.length === 0,
-      size: docs.length,
-      forEach: function (cb) { docs.forEach(cb); },
-    };
-  }
-
-  // ── getDoc / getDocs ────────────────────────────────────────────────────────
-  window.getDoc = function (docRef) {
-    var q = sb.from(docRef.table).select('*').eq('id', docRef.id);
-    if (docRef.extraFilter) {
-      for (var c in docRef.extraFilter) if (Object.prototype.hasOwnProperty.call(docRef.extraFilter, c)) q = q.eq(c, docRef.extraFilter[c]);
-    }
-    return q.maybeSingle().then(function (res) {
-      if (res.error) throw res.error;
-      return makeDocSnapshot(docRef.table, docRef.extraFilter, res.data);
-    });
-  };
-
-  window.getDocs = function (refOrQuery) {
-    var q = buildSelectQuery(refOrQuery);
-    return q.then(function (res) {
-      if (res.error) throw res.error;
-      return makeQuerySnapshot(refOrQuery.table, refOrQuery.extraFilter, res.data);
-    });
-  };
-
-  // ── addDoc / setDoc / updateDoc / deleteDoc ───────────────────────────────
-  window.addDoc = function (collectionRef, data) {
-    var id = generateId();
-    var fields = resolveWriteMarkers(data);
-    var ownerUid = (collectionRef.extraFilter && collectionRef.extraFilter.owner_uid) || null;
-    return sb.rpc('fs_set', { p_table: collectionRef.table, p_id: id, p_fields: fields, p_merge: false, p_owner_uid: ownerUid })
-      .then(function (res) {
-        if (res.error) throw res.error;
-        return { id: id, __type: 'doc', table: collectionRef.table, extraFilter: collectionRef.extraFilter };
-      });
-  };
-
-  window.setDoc = function (docRef, data, options) {
-    var fields = resolveWriteMarkers(data);
-    var merge = !!(options && options.merge);
-    var ownerUid = (docRef.extraFilter && docRef.extraFilter.owner_uid) || null;
-    return sb.rpc('fs_set', { p_table: docRef.table, p_id: docRef.id, p_fields: fields, p_merge: merge, p_owner_uid: ownerUid })
-      .then(function (res) {
-        if (res.error) throw res.error;
-        return undefined;
-      });
-  };
-
-  window.updateDoc = function (docRef, data) {
-    var fields = resolveWriteMarkers(data);
-    return sb.rpc('fs_update', { p_table: docRef.table, p_id: docRef.id, p_fields: fields })
-      .then(function (res) {
-        if (res.error) throw res.error;
-        return undefined;
-      });
-  };
-
-  window.deleteDoc = function (docRef) {
-    var q = sb.from(docRef.table).delete().eq('id', docRef.id);
-    if (docRef.extraFilter) {
-      for (var c in docRef.extraFilter) if (Object.prototype.hasOwnProperty.call(docRef.extraFilter, c)) q = q.eq(c, docRef.extraFilter[c]);
-    }
-    return q.then(function (res) {
-      if (res.error) throw res.error;
-      return undefined;
-    });
-  };
-
-  // ── writeBatch() ────────────────────────────────────────────────────────────
-  function FSWriteBatch() { this.ops = []; }
-  FSWriteBatch.prototype.set = function (docRef, data, options) {
-    this.ops.push({
-      op: 'set', table: docRef.table, id: docRef.id,
-      fields: resolveWriteMarkers(data), merge: !!(options && options.merge),
-      owner_uid: (docRef.extraFilter && docRef.extraFilter.owner_uid) || null,
-    });
-    return this;
-  };
-  FSWriteBatch.prototype.update = function (docRef, data) {
-    this.ops.push({ op: 'update', table: docRef.table, id: docRef.id, fields: resolveWriteMarkers(data) });
-    return this;
-  };
-  FSWriteBatch.prototype.delete = function (docRef) {
-    this.ops.push({ op: 'delete', table: docRef.table, id: docRef.id });
-    return this;
-  };
-  FSWriteBatch.prototype.commit = function () {
-    return sb.rpc('fs_batch_commit', { p_ops: this.ops }).then(function (res) {
-      if (res.error) throw res.error;
-      return res.data;
-    });
-  };
-  window.writeBatch = function () { return new FSWriteBatch(); };
-
-  // ── onSnapshot() — Firestore-style live listener emulation ────────────────
-  // Strategy: fetch the CURRENT full result immediately (matches Firestore's
-  // initial snapshot), then subscribe to Postgres realtime changes on the
-  // underlying table and, on ANY change, re-run the SAME query and re-emit the
-  // full fresh result. This is intentionally simple rather than patching
-  // individual rows client-side: it guarantees correct ordering/filtering/limit
-  // handling on every update, exactly matching what Firestore's onSnapshot
-  // guarantees, at the cost of one extra query per burst of changes (debounced),
-  // which is irrelevant at this app's scale.
-  var channelCounter = 0;
-  window.onSnapshot = function (refOrQuery, onNextOrOptions, onError) {
-    var onNext = onNextOrOptions;
-    var isDoc = refOrQuery.__type === 'doc';
-    var stopped = false;
-    var debounceTimer = null;
-
-    function fetchAndEmit() {
-      if (stopped) return;
-      var p = isDoc ? window.getDoc(refOrQuery) : window.getDocs(refOrQuery);
-      p.then(function (snap) {
-        if (!stopped) onNext(snap);
-      }).catch(function (err) {
-        if (onError) onError(err); else console.error('onSnapshot error:', err);
-      });
+        if (Array.isArray(x)) return x.map(hydrate);
+        var out = {};
+        for (var k in x) { if (Object.prototype.hasOwnProperty.call(x, k)) out[k] = hydrate(x[k]); }
+        return out;
     }
 
-    function scheduleRefetch() {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(fetchAndEmit, 150);
+    function getDeep(obj, path) {
+        var parts = path.split('.');
+        var cur = obj;
+        for (var i = 0; i < parts.length; i++) {
+            if (cur == null) return undefined;
+            cur = cur[parts[i]];
+        }
+        return cur;
+    }
+    function setDeep(obj, path, value) {
+        var parts = path.split('.');
+        var cur = obj;
+        for (var i = 0; i < parts.length - 1; i++) {
+            if (typeof cur[parts[i]] !== 'object' || cur[parts[i]] === null) cur[parts[i]] = {};
+            cur = cur[parts[i]];
+        }
+        cur[parts[parts.length - 1]] = value;
     }
 
-    fetchAndEmit();
-
-    channelCounter += 1;
-    var channelName = 'rt-' + refOrQuery.table + '-' + channelCounter + '-' + Date.now();
-    var changeFilter = { event: '*', schema: 'public', table: refOrQuery.table };
-    if (isDoc && refOrQuery.id) changeFilter.filter = 'id=eq.' + refOrQuery.id;
-
-    var channel = sb.channel(channelName)
-      .on('postgres_changes', changeFilter, function () { scheduleRefetch(); })
-      .subscribe();
-
-    return function unsubscribe() {
-      stopped = true;
-      if (debounceTimer) clearTimeout(debounceTimer);
-      try { sb.removeChannel(channel); } catch (e) { /* no-op */ }
-    };
-  };
-
-  // ── db handle (opaque marker object; nothing reads its internals) ─────────
-  window.db = { __isSupabaseCompatShim: true };
-
-  // ── Auth shim ────────────────────────────────────────────────────────────
-  // Firebase Anonymous Auth in the original app served exactly one purpose the
-  // rest of the code actually depends on: a STABLE uid that (a) gates data
-  // loading behind "auth is ready" and (b) scopes the private notes board.
-  // Firebase persists that anonymous session in the browser across reloads by
-  // default, so we replicate that with a uid stored in localStorage.
-  function getOrCreateAnonUid() {
-    var KEY = 'sb_anon_uid';
-    var uid = null;
-    try { uid = window.localStorage.getItem(KEY); } catch (e) { /* storage may be unavailable */ }
-    if (!uid) {
-      uid = 'anon-' + generateId();
-      try { window.localStorage.setItem(KEY, uid); } catch (e) { /* no-op */ }
+    // mode: 'set' (timpa semua), 'merge' (gabung shallow), 'update' (partial + dot-path)
+    function applyWrite(existingRaw, data, mode) {
+        var target = (mode === 'set') ? {} : clone(existingRaw) || {};
+        Object.keys(data).forEach(function (key) {
+            var raw = data[key];
+            var resolved = raw;
+            if (raw && typeof raw === 'object' && raw.__sentinel === 'serverTimestamp') {
+                resolved = nowTsMarker();
+            } else if (raw && typeof raw === 'object' && raw.__sentinel === 'increment') {
+                var currentVal = Number(getDeep(target, key)) || 0;
+                resolved = currentVal + raw.value;
+            }
+            if (key.indexOf('.') !== -1) {
+                setDeep(target, key, resolved);
+            } else {
+                target[key] = resolved;
+            }
+        });
+        return target;
     }
-    return uid;
-  }
 
-  var authListeners = [];
-  var currentUser = null;
+    // ---------- Referensi: collection / doc / query ----------
+    function isCollRef(x) { return !!x && x.__type === 'collection'; }
+    function isDocRef(x) { return !!x && x.__type === 'doc'; }
+    function isQueryRef(x) { return !!x && x.__type === 'query'; }
 
-  window.auth = { __isSupabaseCompatShim: true };
+    function collection() {
+        var segs = Array.prototype.slice.call(arguments, 1);
+        return { __type: 'collection', path: segs.join('/') };
+    }
 
-  window.signInAnonymously = function () {
-    return Promise.resolve().then(function () {
-      var uid = getOrCreateAnonUid();
-      currentUser = { uid: uid, isAnonymous: true };
-      authListeners.slice().forEach(function (cb) { cb(currentUser); });
-      return { user: currentUser };
-    });
-  };
+    function doc() {
+        var first = arguments[0];
+        if (isCollRef(first)) {
+            var id = arguments[1];
+            if (id === undefined || id === null) id = genId();
+            return { __type: 'doc', path: first.path, id: String(id) };
+        }
+        // doc(db, seg1, seg2, ..., segN) -> segmen terakhir = id dokumen
+        var segs = Array.prototype.slice.call(arguments, 1);
+        var lastId = segs.pop();
+        return { __type: 'doc', path: segs.join('/'), id: String(lastId) };
+    }
 
-  window.signInWithCustomToken = function () {
-    // No custom-token issuing backend in this deployment; a stable anonymous
-    // identity is what the rest of the app actually relies on (see above).
-    return window.signInAnonymously();
-  };
+    function query(base) {
+        var newConstraints = Array.prototype.slice.call(arguments, 1);
+        var baseRef = isQueryRef(base) ? base.base : base;
+        var prevConstraints = isQueryRef(base) ? base.constraints : [];
+        return { __type: 'query', base: baseRef, constraints: prevConstraints.concat(newConstraints) };
+    }
+    function where(field, op, value) { return { __c: 'where', field: field, op: op, value: value }; }
+    function orderBy(field, dir) { return { __c: 'orderBy', field: field, dir: dir || 'asc' }; }
+    function limit(n) { return { __c: 'limit', n: n }; }
 
-  window.onAuthStateChanged = function (auth, callback) {
-    authListeners.push(callback);
-    callback(currentUser);
-    return function unsubscribe() {
-      var idx = authListeners.indexOf(callback);
-      if (idx >= 0) authListeners.splice(idx, 1);
-    };
-  };
+    function resolveToQuery(refOrQuery) {
+        if (isQueryRef(refOrQuery)) return refOrQuery;
+        return { __type: 'query', base: refOrQuery, constraints: [] };
+    }
 
-  // ── App/tenant id (kept only because business logic still references it) ─
-  window.appId = (typeof window.__app_id !== 'undefined') ? window.__app_id : 'default-app-id';
+    function matchWhere(v, op, value) {
+        switch (op) {
+            case '==': return v === value;
+            case '!=': return v !== value;
+            case '>': return v > value;
+            case '>=': return v >= value;
+            case '<': return v < value;
+            case '<=': return v <= value;
+            case 'in': return Array.isArray(value) && value.indexOf(v) !== -1;
+            case 'not-in': return Array.isArray(value) && value.indexOf(v) === -1;
+            case 'array-contains': return Array.isArray(v) && v.indexOf(value) !== -1;
+            case 'array-contains-any': return Array.isArray(v) && Array.isArray(value) && v.some(function (x) { return value.indexOf(x) !== -1; });
+            default: return true;
+        }
+    }
 
+    function sortVal(v) {
+        if (v && typeof v === 'object' && v.__ts === true) return v.seconds * 1000 + (v.nanoseconds || 0) / 1e6;
+        return v;
+    }
+
+    // Kembalikan pasangan {id, data(mentah)} yang sudah difilter/sort/limit
+    function getPairs(path, constraints) {
+        var map = cache[path] || {};
+        var pairs = Object.keys(map).map(function (id) { return { id: id, data: map[id] }; });
+
+        (constraints || []).filter(function (c) { return c.__c === 'where'; }).forEach(function (c) {
+            pairs = pairs.filter(function (p) { return matchWhere(getDeep(p.data, c.field), c.op, c.value); });
+        });
+
+        var orderClauses = (constraints || []).filter(function (c) { return c.__c === 'orderBy'; });
+        if (orderClauses.length) {
+            pairs = pairs.slice().sort(function (a, b) {
+                for (var i = 0; i < orderClauses.length; i++) {
+                    var c = orderClauses[i];
+                    var av = sortVal(getDeep(a.data, c.field));
+                    var bv = sortVal(getDeep(b.data, c.field));
+                    if (av == null && bv == null) continue;
+                    if (av == null) return c.dir === 'desc' ? 1 : -1;
+                    if (bv == null) return c.dir === 'desc' ? -1 : 1;
+                    if (av < bv) return c.dir === 'desc' ? 1 : -1;
+                    if (av > bv) return c.dir === 'desc' ? -1 : 1;
+                }
+                return 0;
+            });
+        }
+
+        var limitC = (constraints || []).filter(function (c) { return c.__c === 'limit'; }).pop();
+        if (limitC) pairs = pairs.slice(0, limitC.n);
+        return pairs;
+    }
+
+    function buildDocSnap(id, rawData, exists) {
+        return {
+            id: id,
+            exists: function () { return exists; },
+            data: function () { return exists ? hydrate(clone(rawData)) : undefined; }
+        };
+    }
+    function buildCollSnap(pairs) {
+        var docs = pairs.map(function (p) { return buildDocSnap(p.id, p.data, true); });
+        return { docs: docs, empty: docs.length === 0, size: docs.length, forEach: function (fn) { docs.forEach(fn); } };
+    }
+
+    // ---------- Operasi baca ----------
+    function getDoc(ref) {
+        return ensureLoaded(ref.path).then(function () {
+            var raw = cache[ref.path] ? cache[ref.path][ref.id] : undefined;
+            return buildDocSnap(ref.id, raw, raw !== undefined);
+        });
+    }
+
+    function getDocs(refOrQuery) {
+        var q = resolveToQuery(refOrQuery);
+        return ensureLoaded(q.base.path).then(function () {
+            return buildCollSnap(getPairs(q.base.path, q.constraints));
+        });
+    }
+
+    function onSnapshot(refOrQuery, onNext, onError) {
+        var docMode = isDocRef(refOrQuery);
+        var path = docMode ? refOrQuery.path : resolveToQuery(refOrQuery).base.path;
+        var constraints = docMode ? [] : resolveToQuery(refOrQuery).constraints;
+        var active = true;
+
+        function emit() {
+            if (!active) return;
+            try {
+                if (docMode) {
+                    var raw = cache[path] ? cache[path][refOrQuery.id] : undefined;
+                    onNext(buildDocSnap(refOrQuery.id, raw, raw !== undefined));
+                } else {
+                    onNext(buildCollSnap(getPairs(path, constraints)));
+                }
+            } catch (e) {
+                if (onError) onError(e); else console.error('[husna-local-db] onSnapshot error:', e);
+            }
+        }
+
+        ensureLoaded(path).then(emit).catch(function (e) { if (onError) onError(e); });
+        if (!listeners[path]) listeners[path] = new Set();
+        listeners[path].add(emit);
+
+        return function unsubscribe() {
+            active = false;
+            if (listeners[path]) listeners[path].delete(emit);
+        };
+    }
+
+    // ---------- Operasi tulis ----------
+    function addDoc(ref, data) {
+        var id = genId();
+        return ensureLoaded(ref.path).then(function () {
+            if (!cache[ref.path]) cache[ref.path] = {};
+            cache[ref.path][id] = applyWrite(undefined, data, 'set');
+            return persist(ref.path).then(function () {
+                notify(ref.path);
+                return { id: id, path: ref.path, __type: 'doc' };
+            });
+        });
+    }
+
+    function setDoc(ref, data, options) {
+        var merge = !!(options && options.merge);
+        return ensureLoaded(ref.path).then(function () {
+            if (!cache[ref.path]) cache[ref.path] = {};
+            var existing = cache[ref.path][ref.id];
+            cache[ref.path][ref.id] = applyWrite(merge ? existing : undefined, data, merge ? 'merge' : 'set');
+            return persist(ref.path).then(function () { notify(ref.path); });
+        });
+    }
+
+    function updateDoc(ref, data) {
+        return ensureLoaded(ref.path).then(function () {
+            var existing = cache[ref.path] ? cache[ref.path][ref.id] : undefined;
+            if (existing === undefined) {
+                return Promise.reject(new Error('[husna-local-db] Dokumen tidak ditemukan: ' + ref.path + '/' + ref.id));
+            }
+            cache[ref.path][ref.id] = applyWrite(existing, data, 'update');
+            return persist(ref.path).then(function () { notify(ref.path); });
+        });
+    }
+
+    function deleteDoc(ref) {
+        return ensureLoaded(ref.path).then(function () {
+            if (cache[ref.path]) delete cache[ref.path][ref.id];
+            return persist(ref.path).then(function () { notify(ref.path); });
+        });
+    }
+
+    function writeBatch() {
+        var ops = [];
+        var api = {
+            set: function (ref, data, options) { ops.push({ type: 'set', ref: ref, data: data, options: options }); return api; },
+            update: function (ref, data) { ops.push({ type: 'update', ref: ref, data: data }); return api; },
+            delete: function (ref) { ops.push({ type: 'delete', ref: ref }); return api; },
+            commit: function () {
+                var pathSet = {};
+                ops.forEach(function (op) { pathSet[op.ref.path] = true; });
+                var paths = Object.keys(pathSet);
+                return Promise.all(paths.map(ensureLoaded)).then(function () {
+                    ops.forEach(function (op) {
+                        if (!cache[op.ref.path]) cache[op.ref.path] = {};
+                        if (op.type === 'delete') {
+                            delete cache[op.ref.path][op.ref.id];
+                        } else if (op.type === 'set') {
+                            var merge = !!(op.options && op.options.merge);
+                            var existing = cache[op.ref.path][op.ref.id];
+                            cache[op.ref.path][op.ref.id] = applyWrite(merge ? existing : undefined, op.data, merge ? 'merge' : 'set');
+                        } else if (op.type === 'update') {
+                            var ex = cache[op.ref.path][op.ref.id];
+                            cache[op.ref.path][op.ref.id] = applyWrite(ex, op.data, 'update');
+                        }
+                    });
+                    return Promise.all(paths.map(persist)).then(function () { paths.forEach(notify); });
+                });
+            }
+        };
+        return api;
+    }
+
+    // ---------- Auth tiruan (lokal, tanpa server) ----------
+    function getOrCreateLocalUid() {
+        try {
+            var existing = localStorage.getItem('husna_local_uid');
+            if (existing) return existing;
+            var uid = 'local_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
+            localStorage.setItem('husna_local_uid', uid);
+            return uid;
+        } catch (e) {
+            return 'local_anon';
+        }
+    }
+    var LOCAL_UID = getOrCreateLocalUid();
+    var localUser = { uid: LOCAL_UID, isAnonymous: true };
+
+    function signInAnonymously() { return Promise.resolve({ user: localUser }); }
+    function signInWithCustomToken() { return Promise.resolve({ user: localUser }); }
+    function onAuthStateChanged(_auth, callback) {
+        setTimeout(function () { callback(localUser); }, 0);
+        return function unsubscribe() {};
+    }
+
+    // ---------- Ekspos ke window (nama sama persis seperti sebelumnya) ----------
+    window.db = { __localDb: true };
+    window.auth = { __localAuth: true };
+    window.signInAnonymously = signInAnonymously;
+    window.signInWithCustomToken = signInWithCustomToken;
+    window.onAuthStateChanged = onAuthStateChanged;
+    window.collection = collection;
+    window.addDoc = addDoc;
+    window.updateDoc = updateDoc;
+    window.deleteDoc = deleteDoc;
+    window.setDoc = setDoc;
+    window.getDoc = getDoc;
+    window.getDocs = getDocs;
+    window.doc = doc;
+    window.onSnapshot = onSnapshot;
+    window.serverTimestamp = serverTimestamp;
+    window.writeBatch = writeBatch;
+    window.query = query;
+    window.orderBy = orderBy;
+    window.where = where;
+    window.increment = increment;
+    window.limit = limit;
+    window.appId = 'default-app-id';
+    window.initialAuthToken = null;
 })();
     </script>
 
@@ -749,7 +666,7 @@
     <!-- React App (Babel) -->
     <script type="text/babel">
         const { useState, useEffect, useRef, useMemo, useCallback } = React;
-        const APP_NAME = "Toko Husna";
+        const APP_NAME = "Apotek Sehat";
 
         // --- CHANGELOG / NOTIFIKASI UPDATE ---
         const CHANGELOG = [
@@ -766,7 +683,7 @@
                     '🔌 Tombol "Mode Offline" muncul di halaman kasir',
                     '⚡ Saat tidak ada internet, klik Mode Offline → langsung ke keranjang belanja',
                     '💾 Transaksi offline disimpan di perangkat (localStorage) dengan waktu CO aktual',
-                    '🔄 Saat kembali online, semua transaksi offline tersinkronkan otomatis ke Firebase',
+                    '🔄 Transaksi offline tersinkronkan otomatis ke penyimpanan lokal',
                     '🟡 Badge orange menunjukkan jumlah transaksi yang belum tersinkron',
                     '📡 Indikator status koneksi (Online/Offline) muncul di banner toko',
                 ],
@@ -972,7 +889,7 @@
                 id: 'v47_7',
                 version: 'v47.7',
                 date: '10 Feb 2025',
-                title: 'Perbaikan Sinkronisasi Firebase',
+                title: 'Perbaikan Sinkronisasi Data',
                 tag: 'Bug Fix',
                 tagColor: 'bg-amber-100 text-amber-700',
                 icon: 'rotate',
@@ -4127,7 +4044,7 @@
                                     {/* TRANSFER */}
                                     <div>
                                         <div className="flex items-center gap-2 mb-3"><Icon name="building-columns" className="text-teal-600 text-base" /><span className="text-sm font-bold text-slate-700">Info Rekening Transfer</span></div>
-                                        <textarea value={localSettings.transferInfo || ''} onChange={(e) => handleChange('transferInfo', e.target.value)} className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-teal-400 outline-none text-sm h-24 transition-colors" placeholder={"Contoh:\nBCA 1234567890\na.n. Toko Husna"} />
+                                        <textarea value={localSettings.transferInfo || ''} onChange={(e) => handleChange('transferInfo', e.target.value)} className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-teal-400 outline-none text-sm h-24 transition-colors" placeholder={"Contoh:\nBCA 1234567890\na.n. Apotek Sehat"} />
                                         <p className="text-[10px] text-slate-400 mt-1">Tulis nama bank dan nomor rekening. Jika kosong, Transfer tidak akan muncul di kasir.</p>
                                     </div>
                                 </div>
@@ -4676,7 +4593,7 @@
                 try {
                     const ExcelJS = window.ExcelJS;
                     const workbook = new ExcelJS.Workbook();
-                    workbook.creator = 'Sistem Kasir Husna';
+                    workbook.creator = 'Sistem Kasir Apotek Sehat';
                     workbook.created = new Date();
                     const sheet = workbook.addWorksheet('Perbandingan Harga PBF');
 
@@ -7733,15 +7650,11 @@
                     const snap = autoSaveSnap.current;
                     if (snap?.isSessionActive && snap?.activeCartId) {
                         try {
+                            const projectId = window.db?.app?.options?.projectId;
                             const cartId = snap.activeCartId;
-                            if (cartId) {
-                                // Supabase equivalent of the old direct-REST beacon: hits the
-                                // mark_cart_inactive RPC (see supabase_migration.sql) via a plain
-                                // POST, since navigator.sendBeacon cannot set custom headers (so
-                                // the apikey is passed as a query param, which Supabase's gateway
-                                // also accepts for exactly this use case).
-                                const url = window.SUPABASE_URL + '/rest/v1/rpc/mark_cart_inactive?apikey=' + window.SUPABASE_ANON_KEY;
-                                const body = JSON.stringify({ p_id: cartId });
+                            if (projectId && cartId) {
+                                const url = 'https://firestore.googleapis.com/v1/projects/' + projectId + '/databases/(default)/documents/artifacts/' + window.appId + '/public/data/active_carts/' + cartId + '?updateMask.fieldPaths=isActive';
+                                const body = JSON.stringify({ fields: { isActive: { booleanValue: false } } });
                                 navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
                             }
                         } catch(e) { /* silent - best effort */ }
@@ -11788,6 +11701,23 @@
 
             const exampleText = `Amoxsan 500mg, 10, Box, A-1, , 50000\nParacetamol Sirup, 5, Botol, B-2, 2024-12-31, 15000\nVitamin C IPI, 50, Botol, Kasir, , 8000`;
 
+            // Daftar obat bebas yang umum dijual. Harga hanya perkiraan, silakan sesuaikan sebelum disimpan.
+            const sampleMedicines = `Paracetamol 500mg, 100, Strip, A-1, 2028-06-30, 5000
+Panadol Biru, 50, Strip, A-1, 2028-03-31, 11000
+Bodrex, 60, Strip, A-2, 2028-01-31, 3500
+Promag, 40, Strip, B-1, 2028-05-31, 9000
+Antasida DOEN Tablet, 80, Strip, B-1, 2027-12-31, 3000
+Ambroxol 30mg, 60, Strip, C-1, 2028-02-28, 6000
+OBH Combi Batuk Flu 100ml, 20, Botol, C-2, 2027-10-31, 18000
+Cetirizine 10mg, 50, Strip, D-1, 2028-04-30, 8000
+CTM 4mg, 100, Strip, D-1, 2028-07-31, 2500
+Oralit, 100, Sachet, E-1, 2028-08-31, 2000
+Diapet, 30, Strip, E-1, 2027-11-30, 9500
+Vitamin C IPI 500mg, 40, Botol, F-1, 2028-09-30, 12000
+Betadine Antiseptik 15ml, 25, Botol, G-1, 2028-03-31, 14000
+Minyak Kayu Putih 60ml, 30, Botol, G-2, 2028-12-31, 25000
+Plester Luka Hansaplast, 100, Pcs, G-3, 2029-01-31, 1000`;
+
             return (
                 <div className="fade-in max-w-2xl mx-auto w-full pt-4 md:pt-10">
                     <div className="bg-white/80 backdrop-blur-md p-6 rounded-[30px] shadow-soft border border-white">
@@ -11798,7 +11728,7 @@
                         
                         {step === 'input' ? (
                             <div className="space-y-4">
-                                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs text-slate-600"><p className="font-bold mb-1">Format (Excel/Tab atau Koma):</p><code className="block bg-slate-100 p-2 rounded text-slate-800 font-mono border border-slate-200">Nama, Qty, Satuan, Rak, Exp, Harga</code><button onClick={() => setTextInput(exampleText)} className="mt-2 text-[10px] font-bold text-sky-500 hover:underline">+ Pakai Contoh Format</button></div>
+                                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs text-slate-600"><p className="font-bold mb-1">Format (Excel/Tab atau Koma):</p><code className="block bg-slate-100 p-2 rounded text-slate-800 font-mono border border-slate-200">Nama, Qty, Satuan, Rak, Exp, Harga</code><button onClick={() => setTextInput(exampleText)} className="mt-2 text-[10px] font-bold text-sky-500 hover:underline">+ Pakai Contoh Format</button><button onClick={() => setTextInput(sampleMedicines)} className="mt-2 ml-4 text-[10px] font-bold text-emerald-600 hover:underline">+ Isi 15 Contoh Obat</button></div>
                                 <textarea className="w-full h-48 p-4 rounded-xl bg-slate-50 border border-slate-200 focus:bg-white focus:ring-2 focus:ring-sky-200 outline-none text-sm font-mono whitespace-pre" placeholder={`Paste data Excel di sini...\nContoh:\nPanadol, 10, strip, A1, , 10000`} value={textInput} onChange={e => setTextInput(e.target.value)}></textarea>
                                 <button onClick={handleParse} disabled={!textInput.trim()} className="w-full py-3.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold shadow-lg shadow-sky-200 active:scale-95 transition-all flex items-center justify-center gap-2 text-sm disabled:opacity-50 disabled:scale-100"><Icon name="magnifying-glass-chart" /> Analisa Data</button>
                             </div>
@@ -11956,7 +11886,7 @@
                     <div className="bg-gradient-to-r from-night-900 to-sky-900 rounded-3xl p-5 md:p-6 text-white relative overflow-hidden shadow-2xl border border-slate-700 group">
                         <div className="absolute right-0 top-0 w-48 h-48 bg-gold-400 opacity-10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2"></div>
                         <div className="relative z-10 flex items-center justify-between">
-                            <div><h3 className="font-bold text-xl md:text-2xl text-sky-300 mb-1 flex items-center gap-2"><Icon name="cash-register" className="text-sky-400" /> Sistem Kasir Husna</h3><p className="text-xs md:text-sm text-slate-300 font-medium opacity-90">Kelola toko lebih cepat, lebih mudah, lebih akurat ⚡</p><div className="mt-3 inline-flex items-center gap-2 bg-green-500/20 px-3 py-1 rounded-full backdrop-blur-sm border border-green-500/30"><div className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></div><span className="text-[10px] font-bold tracking-wide text-green-300">ONLINE (SUPABASE)</span></div></div>
+                            <div><h3 className="font-bold text-xl md:text-2xl text-sky-300 mb-1 flex items-center gap-2"><Icon name="cash-register" className="text-sky-400" /> Sistem Kasir Apotek Sehat</h3><p className="text-xs md:text-sm text-slate-300 font-medium opacity-90">Kelola toko lebih cepat, lebih mudah, lebih akurat ⚡</p><div className="mt-3 inline-flex items-center gap-2 bg-green-500/20 px-3 py-1 rounded-full backdrop-blur-sm border border-green-500/30"><div className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></div><span className="text-[10px] font-bold tracking-wide text-green-300">TERSIMPAN LOKAL</span></div></div>
                             <div className="text-4xl text-sky-400/80 animate-pulse"><Icon name="store" /></div>
                         </div>
                     </div>
@@ -14694,7 +14624,7 @@
             const exportHistoryToExcel = async (detail) => {
                 try {
                     const workbook = new ExcelJS.Workbook();
-                    workbook.creator = 'Sistem Kasir Husna';
+                    workbook.creator = 'Sistem Kasir Apotek Sehat';
                     workbook.created = new Date();
                     const sheet = workbook.addWorksheet('Stock Opname');
 
@@ -15254,7 +15184,28 @@
 
         // ==================== AUTH UTILITIES ====================
         const INVITATION_CODE = "12345670";
-        const OWNER_EMAILS = ["kayzen796@gmail.com", "sugaramilk99@gmail.com"];
+
+        // Obat contoh yang otomatis diisi sekali saja kalau database barang masih kosong.
+        // Format: [nama, stok, satuan, rak, kedaluwarsa, harga jual, harga beli]
+        const SAMPLE_MEDICINES = [
+            ['Paracetamol 500mg', 100, 'Strip', 'A-1', '2028-06-30', 5000, 3500],
+            ['Panadol Biru', 50, 'Strip', 'A-1', '2028-03-31', 11000, 9000],
+            ['Bodrex', 60, 'Strip', 'A-2', '2028-01-31', 3500, 2700],
+            ['Promag', 40, 'Strip', 'B-1', '2028-05-31', 9000, 7200],
+            ['Antasida DOEN Tablet', 80, 'Strip', 'B-1', '2027-12-31', 3000, 2000],
+            ['Ambroxol 30mg', 60, 'Strip', 'C-1', '2028-02-28', 6000, 4200],
+            ['OBH Combi Batuk Flu 100ml', 20, 'Botol', 'C-2', '2027-10-31', 18000, 14500],
+            ['Cetirizine 10mg', 50, 'Strip', 'D-1', '2028-04-30', 8000, 5500],
+            ['CTM 4mg', 100, 'Strip', 'D-1', '2028-07-31', 2500, 1500],
+            ['Oralit', 100, 'Sachet', 'E-1', '2028-08-31', 2000, 1200],
+            ['Diapet', 30, 'Strip', 'E-1', '2027-11-30', 9500, 7500],
+            ['Vitamin C IPI 500mg', 40, 'Botol', 'F-1', '2028-09-30', 12000, 9500],
+            ['Betadine Antiseptik 15ml', 25, 'Botol', 'G-1', '2028-03-31', 14000, 11000],
+            ['Minyak Kayu Putih 60ml', 30, 'Botol', 'G-2', '2028-12-31', 25000, 20000],
+            ['Plester Luka Hansaplast', 100, 'Pcs', 'G-3', '2029-01-31', 1000, 600],
+        ];
+        const ADMIN_EMAIL = "admin@husna.com"; // akun bawaan: username admin / password 1234
+        const OWNER_EMAILS = ["kayzen796@gmail.com", "sugaramilk99@gmail.com", ADMIN_EMAIL];
         const OWNER_EMAIL = OWNER_EMAILS[0]; // email utama untuk tampilan pesan
         const isOwnerEmail = (email) => OWNER_EMAILS.includes((email || '').toLowerCase());
 
@@ -15308,6 +15259,13 @@
                     if (!foundUser) {
                         const snapUser = await window.getDocs(qUsername);
                         if (!snapUser.empty) foundUser = { id: snapUser.docs[0].id, ...snapUser.docs[0].data() };
+                    }
+
+                    // Akun admin bawaan: dibuat otomatis saat pertama kali dipakai login (admin / 1234)
+                    if (!foundUser && loginForm.emailOrUsername.trim().toLowerCase() === 'admin' && loginForm.password === '1234') {
+                        const adminData = { namaLengkap: 'Admin', username: 'admin', email: ADMIN_EMAIL, whatsapp: '', password: hashedPass, createdAt: window.serverTimestamp(), role: 'admin', isActive: true };
+                        const adminRef = await window.addDoc(usersRef, adminData);
+                        foundUser = { id: adminRef.id, ...adminData };
                     }
 
                     if (!foundUser) { setErrTimeout('Akun tidak ditemukan'); setLoading(false); return; }
@@ -15445,7 +15403,7 @@
                                     <Icon name="shop" className="text-white text-2xl" />
                                 </div>
                             </div>
-                            <h1 className="font-black text-2xl text-slate-800 tracking-tight">Husna Group</h1>
+                            <h1 className="font-black text-2xl text-slate-800 tracking-tight">Apotek Sehat</h1>
                             <p className="text-slate-500 text-sm font-medium mt-1">Sistem Kasir & Manajemen Stok</p>
                         </div>
 
@@ -15579,7 +15537,7 @@
 
                         {/* Footer */}
                         <div className="px-8 pb-6 text-center">
-                            <p className="text-xs text-slate-400">© Toko Husna • Sistem Kasir V37 <span className="mx-1">•</span> <Icon name="shield-halved" className="text-green-400" /> Aman & Terenkripsi</p>
+                            <p className="text-xs text-slate-400">© Apotek Sehat • Sistem Kasir V37 <span className="mx-1">•</span> <Icon name="shield-halved" className="text-green-400" /> Aman & Terenkripsi</p>
                         </div>
                     </div>
                 </div>
@@ -19592,6 +19550,7 @@
                 const App = () => {
             const [inventoryData, setInventoryData] = useState([]);
             const [rawInventory, setRawInventory] = useState([]); // Store original data from DB
+            const sampleSeedRef = useRef(false);
             const [settingsData, setSettingsData] = useState(DEFAULT_SETTINGS); 
             const [loading, setLoading] = useState(true);
             const [activeTab, setActiveTab] = useState('cashier'); 
@@ -19638,19 +19597,19 @@
                 let unsub;
                 let _synced = false; // hanya sync sekali per session
 
-                // ── Auto-upsert: push entri CHANGELOG baru ke Firebase ──
-                // Jika versi di CHANGELOG (hardcode) belum ada di Firebase, tambahkan otomatis.
+                // ── Auto-upsert: simpan entri CHANGELOG baru ke penyimpanan lokal ──
+                // Jika versi di CHANGELOG (hardcode) belum ada di penyimpanan lokal, tambahkan otomatis.
                 // Admin panel akan langsung menerima update tanpa perlu ubah HTML admin.
-                async function autoSyncChangelogToFirebase(firestoreDocs) {
+                async function autoSyncChangelogToLocal(localDocs) {
                     if (_synced) return;
                     _synced = true;
                     try {
-                        const existingIds = new Set(firestoreDocs.map(d => d.id));
+                        const existingIds = new Set(localDocs.map(d => d.id));
                         const newEntries = CHANGELOG.filter(c => !existingIds.has(c.id));
                         if (newEntries.length === 0) return;
                         // Hitung posisi awal: letakkan entri baru di urutan terdepan (posisi terkecil)
-                        const minPos = firestoreDocs.length > 0
-                            ? Math.min(...firestoreDocs.map(d => d.data?.()?.position ?? d.position ?? 99))
+                        const minPos = localDocs.length > 0
+                            ? Math.min(...localDocs.map(d => d.data?.()?.position ?? d.position ?? 99))
                             : 0;
                         const batch = window.writeBatch(window.db);
                         newEntries.forEach((entry, i) => {
@@ -19667,7 +19626,7 @@
                             }, { merge: false });
                         });
                         await batch.commit();
-                        console.log(`✅ ${newEntries.length} entri changelog baru di-sync ke Firebase`);
+                        console.log(`✅ ${newEntries.length} entri changelog baru disimpan ke lokal`);
                     } catch(e) {
                         console.warn('Auto-sync changelog gagal:', e);
                     }
@@ -19678,10 +19637,10 @@
                         if (!snap.empty) {
                             const sorted = snap.docs.map(d => ({ id: d.id, ...d.data() }));
                             setLiveChangelog(sorted);
-                            autoSyncChangelogToFirebase(snap.docs);
+                            autoSyncChangelogToLocal(snap.docs);
                         } else {
-                            // Firebase kosong → seed dari CHANGELOG hardcode
-                            autoSyncChangelogToFirebase([]);
+                            // Penyimpanan lokal kosong → seed dari CHANGELOG hardcode
+                            autoSyncChangelogToLocal([]);
                         }
                     }, () => {
                         // fallback tanpa orderBy
@@ -19690,9 +19649,9 @@
                                 const sorted = snap.docs.map(d => ({ id: d.id, ...d.data() }))
                                     .sort((a, b) => (a.position ?? 99) - (b.position ?? 99));
                                 setLiveChangelog(sorted);
-                                autoSyncChangelogToFirebase(snap.docs);
+                                autoSyncChangelogToLocal(snap.docs);
                             } else {
-                                autoSyncChangelogToFirebase([]);
+                                autoSyncChangelogToLocal([]);
                             }
                         });
                     });
@@ -19891,7 +19850,17 @@
                 const docRef = window.doc(window.db, 'artifacts', window.appId, 'public', 'data', 'settings', 'global');
                 const unsub = window.onSnapshot(docRef, (docSnap) => { 
                     if(docSnap.exists()){ 
-                        const fetched = docSnap.data();
+                        let fetched = docSnap.data();
+                        // Ganti nama lama "Toko Husna" yang sudah tersimpan jadi "Apotek Sehat"
+                        const OLD_NAME = 'Toko Husna';
+                        if (fetched.storeName === OLD_NAME || (fetched.storeProfiles || []).some(p => p.name === OLD_NAME)) {
+                            fetched = {
+                                ...fetched,
+                                storeName: fetched.storeName === OLD_NAME ? APP_NAME : fetched.storeName,
+                                storeProfiles: (fetched.storeProfiles || []).map(p => p.name === OLD_NAME ? { ...p, name: APP_NAME } : p)
+                            };
+                            window.setDoc(docRef, { storeName: fetched.storeName, storeProfiles: fetched.storeProfiles }, { merge: true }).catch(() => {});
+                        }
                         setSettingsData({ ...DEFAULT_SETTINGS, ...fetched }); 
                         
                         // Hanya set tab saat pertama kali load, bukan saat ganti toko
@@ -19920,6 +19889,32 @@
                     const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     setRawInventory(data); // Save raw data
                     setLoading(false);
+                    // Isi obat contoh sekali saja (dilewati kalau namanya sudah ada)
+                    if (!sampleSeedRef.current) {
+                        sampleSeedRef.current = true;
+                        (async () => {
+                            try {
+                                const flagRef = window.doc(window.db, 'artifacts', window.appId, 'public', 'data', 'system_codes', 'sample_seed');
+                                const flagSnap = await window.getDoc(flagRef);
+                                if (flagSnap.exists()) return;
+                                const existingNames = new Set(data.map(d => (d.name || '').toLowerCase()));
+                                const seedStoreId = (activeStoreId && activeStoreId !== 'all_stores') ? activeStoreId : 'default';
+                                const invRef = window.collection(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory');
+                                const batch = window.writeBatch(window.db);
+                                SAMPLE_MEDICINES.forEach(([name, qty, unit, rack, exp, price, costPrice], i) => {
+                                    if (existingNames.has(name.toLowerCase())) return;
+                                    batch.set(window.doc(invRef, 'contoh_obat_' + (i + 1)), {
+                                        name, unit, rack, exp, price, costPrice,
+                                        stocks: { default: qty, [seedStoreId]: qty }, qty,
+                                        isSample: true,
+                                        createdAt: window.serverTimestamp(), updatedAt: window.serverTimestamp()
+                                    });
+                                });
+                                batch.set(flagRef, { done: true, at: window.serverTimestamp() });
+                                await batch.commit();
+                            } catch (seedErr) { console.warn('Gagal mengisi obat contoh:', seedErr); }
+                        })();
+                    }
                 }, (error) => { console.error("Firestore Error:", error); showToast("Gagal memuat data live", "error"); });
                 return () => unsubscribeSnapshot();
             }, [user]);
@@ -20634,7 +20629,7 @@
                                                     </div>
                                                 </div>
                                             ))}
-                                            <div className="px-4 py-2.5 bg-slate-50 border-t border-slate-100"><p className="text-[10px] text-center text-slate-400 font-bold">Sistem Kasir Toko Husna • Selalu diperbarui 🚀</p><p className="text-[10px] text-center text-sky-400 font-bold mt-0.5">💬 Ada masukkan? Gunakan tab <b>Pesan &amp; Lapor</b> untuk hubungi admin!</p></div>
+                                            <div className="px-4 py-2.5 bg-slate-50 border-t border-slate-100"><p className="text-[10px] text-center text-slate-400 font-bold">Sistem Kasir Apotek Sehat • Selalu diperbarui 🚀</p><p className="text-[10px] text-center text-sky-400 font-bold mt-0.5">💬 Ada masukkan? Gunakan tab <b>Pesan &amp; Lapor</b> untuk hubungi admin!</p></div>
                                         </div>
                                     )}
 
