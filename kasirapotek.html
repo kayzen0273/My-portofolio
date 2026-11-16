@@ -15438,6 +15438,16 @@ Plester Luka Hansaplast, 100, Pcs, G-3, 2029-01-31, 1000`;
                                     <button className="w-full text-center text-sky-600 text-sm font-semibold hover:underline mt-2" onClick={()=>{setView('forgot');setError('');setSuccess('');}}>
                                         <Icon name="key" className="mr-1" /> Lupa Password?
                                     </button>
+                                    <div className="mt-2 px-4 py-3 bg-sky-50 border border-sky-200 rounded-xl">
+                                        <p className="text-[11px] font-bold text-sky-700 uppercase tracking-wide mb-1.5"><Icon name="user-shield" className="mr-1" />Akun Admin</p>
+                                        <div className="flex items-center justify-between text-sm text-slate-700">
+                                            <span>Username: <b className="font-mono">admin</b></span>
+                                            <span>Password: <b className="font-mono">1234</b></span>
+                                        </div>
+                                        <button type="button" className="mt-2 w-full text-center text-sky-600 text-xs font-bold hover:underline" onClick={()=>setLoginForm({emailOrUsername:'admin',password:'1234'})}>
+                                            Isi otomatis
+                                        </button>
+                                    </div>
                                 </div>
                             )}
 
